@@ -1,0 +1,146 @@
+# Dissect BioCLIP's image tower with BioCLIP scoring the concepts.
+#
+# Mirrors the conventions in Label-free-CBM/k8s/job-trial-treeoflife.yaml:
+#   - limits within 20% of requests for cpu / memory / ephemeral-storage
+#   - GPU request == limit (required for extended resources)
+#   - restartPolicy Never and a real, terminating command -- no sleep/interactive
+#   - activeDeadlineSeconds bounds the run; ttlSecondsAfterFinished cleans it up
+#   - no A100 in the affinity list (those need prior access approval)
+#
+# Edit the env block below to change what gets dissected -- everything the run
+# depends on is a variable there, so no need to touch the args script.
+#
+# Submit:  kubectl apply -f k8s/job-dissect-bioclip.yaml
+# Watch:   kubectl logs -f job/clipdissect-bioclip
+# Clean:   kubectl delete job clipdissect-bioclip
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: clipdissect-bioclip
+  labels:
+    app: clipdissect
+    run: bioclip
+spec:
+  backoffLimit: 0                 # a failing config fails identically on retry -- don't burn GPU
+  activeDeadlineSeconds: 14400    # hard stop at 4h
+  ttlSecondsAfterFinished: 86400  # auto-delete the finished Job after a day
+  template:
+    metadata:
+      labels:
+        app: clipdissect
+        run: bioclip
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: dissect
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          env:
+            - name: HF_HOME
+              value: /workspace/.cache/huggingface
+            - name: TORCH_HOME
+              value: /workspace/.cache/torch
+            - name: PIP_CACHE_DIR
+              value: /workspace/.cache/pip
+            # Reuses the checkpoint already staged for Label-free-CBM. Delete this
+            # to pull from the Hub into HF_HOME instead.
+            - name: CLIP_DISSECT_BIOCLIP_CKPT
+              value: /workspace/models/bioclip/open_clip_pytorch_model.bin
+            # --- what to dissect -------------------------------------------------
+            - name: CLIP_MODEL
+              value: bioclip
+            - name: TARGET_MODEL
+              value: bioclip
+            - name: TARGET_LAYERS
+              value: block_8,block_9,block_10,block_11,out
+            - name: D_PROBE
+              value: imagefolder:/workspace/data/treeoflife/val
+            - name: CONCEPT_SET
+              value: data/20k.txt
+            - name: SIMILARITY_FN
+              value: soft_wpmi
+            - name: BATCH_SIZE
+              value: "200"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+
+              echo "===== environment ====="
+              nvidia-smi
+              source /opt/conda/etc/profile.d/conda.sh
+              conda activate /workspace/envs/lfcbm
+              cd /workspace/CLIP-dissect
+              python -c "import torch; print('torch', torch.__version__, '| cuda available:', torch.cuda.is_available())"
+              python -c "import open_clip; print('open_clip', open_clip.__version__)"
+
+              echo "===== code version ====="
+              git rev-parse HEAD
+              git status --short || true
+
+              echo "===== preflight ====="
+              # Fail on a missing input now rather than after the target activations
+              # have already been computed.
+              test -f "$CONCEPT_SET" \
+                || { echo "FATAL: no concept set at $CONCEPT_SET"; exit 1; }
+              case "$D_PROBE" in
+                imagefolder:*) test -d "${D_PROBE#imagefolder:}" \
+                  || { echo "FATAL: no probing directory ${D_PROBE#imagefolder:}"; exit 1; } ;;
+              esac
+              python list_layers.py --target_model "$TARGET_MODEL" --device cpu
+
+              echo "===== dissect ====="
+              python describe_neurons.py \
+                --clip_model    "$CLIP_MODEL" \
+                --target_model  "$TARGET_MODEL" \
+                --target_layers "$TARGET_LAYERS" \
+                --d_probe       "$D_PROBE" \
+                --concept_set   "$CONCEPT_SET" \
+                --similarity_fn "$SIMILARITY_FN" \
+                --batch_size    "$BATCH_SIZE" \
+                --device cuda \
+                --activation_dir /workspace/clip-dissect/saved_activations \
+                --result_dir     /workspace/clip-dissect/results
+
+              echo "===== results ====="
+              ls -lt /workspace/clip-dissect/results | head
+          volumeMounts:
+            - name: ml-storage
+              mountPath: /workspace
+            - name: dshm
+              mountPath: /dev/shm     # utils.py defaults to 8 workers; needs more than the 64Mi default
+          resources:
+            requests:
+              cpu: "4"
+              memory: "12Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4600m"               # +15% of request
+              memory: "14Gi"             # +16.7%
+              ephemeral-storage: "12Gi"   # +20%
+              nvidia.com/gpu: "1"        # must equal the request
+      volumes:
+        - name: ml-storage
+          persistentVolumeClaim:
+            claimName: ayush-workspace
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 6Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-A10

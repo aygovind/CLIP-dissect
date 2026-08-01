@@ -1,13 +1,43 @@
+import hashlib
 import os
 import math
 import numpy as np
 import torch
-import clip
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import data_utils
 
 PM_SUFFIX = {"max":"_max", "avg":""}
+
+# 8 workers needs a /dev/shm larger than the 64Mi a container gets by default, and
+# is wasted on a 2-CPU pod. Override with CLIP_DISSECT_NUM_WORKERS.
+NUM_WORKERS = int(os.environ.get("CLIP_DISSECT_NUM_WORKERS", 8))
+
+
+def load_concepts(concept_set):
+    """Read a concept set file into a list of concepts.
+
+    Blank lines and surrounding whitespace are dropped here and nowhere else, so
+    that the index of a concept in this list always matches the row of its text
+    embedding. Doing the filtering in two places (as the original code did, once
+    in save_activations and once in describe_neurons) silently shifts every
+    description after a blank line onto the wrong concept.
+    """
+    with open(concept_set, 'r') as f:
+        words = f.read().split('\n')
+    return [w.strip() for w in words if w.strip() != ""]
+
+
+def format_concepts(words, prompt_template="{}"):
+    """Apply a prompt template to each concept before tokenisation.
+
+    The default reproduces the original behaviour (the bare concept). BioCLIP was
+    trained on captions like 'a photo of <taxon>', so a template such as
+    "a photo of {}." can matter more for it than it does for OpenAI CLIP.
+    """
+    if "{}" not in prompt_template:
+        raise ValueError("prompt_template must contain '{{}}', got {!r}".format(prompt_template))
+    return [prompt_template.format(word) for word in words]
 
 def get_activation(outputs, mode):
     '''
@@ -32,14 +62,32 @@ def get_activation(outputs, mode):
                 outputs.append(output.detach())
     return hook
 
+def _clean_name(name):
+    """Make a model/dataset name safe and unique as a filename component.
+
+    '/' is stripped rather than replaced so that existing caches keyed on OpenAI
+    CLIP names ('ViT-B/16' -> 'ViT-B16') stay valid. Names that embed a filesystem
+    path ('imagefolder:/data/birds' -> 'imagefolder_birds_1a2b3c4d') collapse to
+    the basename plus a digest, since flattening the whole path is unreadable and
+    would let /a/b collide with /ab.
+    """
+    if name.startswith(('/', './', '../', '~')) or any(m in name for m in (':/', ':./', ':~')):
+        prefix, _, path = name.rpartition(':')
+        stem = os.path.basename(path.rstrip('/')) or "root"
+        digest = hashlib.md5(path.encode()).hexdigest()[:8]
+        return "_".join(p for p in (prefix.replace(':', '_'), stem, digest) if p)
+    return name.replace('\\', '/').replace('/', '').replace(':', '_')
+
+
 def get_save_names(clip_name, target_name, target_layer, d_probe, concept_set, pool_mode, save_dir):
-    
-    target_save_name = "{}/{}_{}_{}{}.pt".format(save_dir, d_probe, target_name, target_layer,
+
+    target_save_name = "{}/{}_{}_{}{}.pt".format(save_dir, _clean_name(d_probe),
+                                             _clean_name(target_name), target_layer,
                                              PM_SUFFIX[pool_mode])
-    clip_save_name = "{}/{}_{}.pt".format(save_dir, d_probe, clip_name.replace('/', ''))
+    clip_save_name = "{}/{}_{}.pt".format(save_dir, _clean_name(d_probe), _clean_name(clip_name))
     concept_set_name = (concept_set.split("/")[-1]).split(".")[0]
-    text_save_name = "{}/{}_{}.pt".format(save_dir, concept_set_name, clip_name.replace('/', ''))
-    
+    text_save_name = "{}/{}_{}.pt".format(save_dir, concept_set_name, _clean_name(clip_name))
+
     return target_save_name, clip_save_name, text_save_name
 
 def save_target_activations(target_model, dataset, save_name, target_layers = ["layer4"], batch_size = 1000,
@@ -63,7 +111,7 @@ def save_target_activations(target_model, dataset, save_name, target_layers = ["
         hooks[target_layer] = eval(command)
     
     with torch.no_grad():
-        for images, labels in tqdm(DataLoader(dataset, batch_size, num_workers=8, pin_memory=True)):
+        for images, labels in tqdm(DataLoader(dataset, batch_size, num_workers=NUM_WORKERS, pin_memory=True)):
             features = target_model(images.to(device))
     
     for target_layer in target_layers:
@@ -86,7 +134,7 @@ def save_clip_image_features(model, dataset, save_name, batch_size=1000 , device
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     with torch.no_grad():
-        for images, labels in tqdm(DataLoader(dataset, batch_size, num_workers=8, pin_memory=True)):
+        for images, labels in tqdm(DataLoader(dataset, batch_size, num_workers=NUM_WORKERS, pin_memory=True)):
             features = model.encode_image(images.to(device))
             all_features.append(features)
     torch.save(torch.cat(all_features), save_name)
@@ -120,22 +168,20 @@ def get_clip_text_features(model, text, batch_size=1000):
     text_features = torch.cat(text_features, dim=0)
     return text_features
 
-def save_activations(clip_name, target_name, target_layers, d_probe, 
-                     concept_set, batch_size, device, pool_mode, save_dir):
-    
-    clip_model, clip_preprocess = clip.load(clip_name, device=device)
+def save_activations(clip_name, target_name, target_layers, d_probe,
+                     concept_set, batch_size, device, pool_mode, save_dir,
+                     prompt_template="{}"):
+
+    clip_model, clip_preprocess, tokenizer = data_utils.get_clip_model(clip_name, device)
     target_model, target_preprocess = data_utils.get_target_model(target_name, device)
     #setup data
     data_c = data_utils.get_data(d_probe, clip_preprocess)
     data_t = data_utils.get_data(d_probe, target_preprocess)
 
-    with open(concept_set, 'r') as f: 
-        words = (f.read()).split('\n')
-    #ignore empty lines
-    words = [i for i in words if i!=""]
-    
-    text = clip.tokenize(["{}".format(word) for word in words]).to(device)
-    
+    words = load_concepts(concept_set)
+
+    text = tokenizer(format_concepts(words, prompt_template)).to(device)
+
     save_names = get_save_names(clip_name = clip_name, target_name = target_name,
                                 target_layer = '{}', d_probe = d_probe, concept_set = concept_set,
                                 pool_mode=pool_mode, save_dir = save_dir)
@@ -172,13 +218,19 @@ def get_similarity_from_activations(target_save_name, clip_save_name, text_save_
         torch.cuda.empty_cache()
         return similarity
 
-def get_cos_similarity(preds, gt, clip_model, mpnet_model, device="cuda", batch_size=200):
+def get_cos_similarity(preds, gt, clip_model, mpnet_model, device="cuda", batch_size=200,
+                       tokenizer=None):
     """
     preds: predicted concepts, list of strings
     gt: correct concepts, list of strings
+    tokenizer: defaults to OpenAI CLIP's; pass the one returned by
+               data_utils.get_clip_model when clip_model is an open_clip model
     """
-    pred_tokens = clip.tokenize(preds).to(device)
-    gt_tokens = clip.tokenize(gt).to(device)
+    if tokenizer is None:
+        import clip
+        tokenizer = clip.tokenize
+    pred_tokens = tokenizer(preds).to(device)
+    gt_tokens = tokenizer(gt).to(device)
     pred_embeds = []
     gt_embeds = []
 

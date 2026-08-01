@@ -46,9 +46,24 @@ def cos_similarity(clip_feats, target_feats, device='cuda'):
             similarities.append(torch.cat(curr_similarities, dim=1))
     return torch.cat(similarities, dim=0)
 
+def _check_top_k(top_k, target_feats, fn_name):
+    """These estimators rank the top_k most-activating probe images per neuron.
+
+    A probing set smaller than top_k otherwise dies inside torch.topk with a bare
+    'selected index k out of range', which is easy to hit with a custom d_probe.
+    """
+    n_images = target_feats.shape[0]
+    if top_k > n_images:
+        raise ValueError(
+            "{} needs at least top_k={} probing images, but d_probe has only {}. Use a "
+            "larger probing dataset, lower top_k, or switch to "
+            "--similarity_fn cos_similarity.".format(fn_name, top_k, n_images))
+
+
 def soft_wpmi(clip_feats, target_feats, top_k=100, a=10, lam=1, device='cuda',
                         min_prob=1e-7, p_start=0.998, p_end=0.97):
-    
+    _check_top_k(top_k, target_feats, "soft_wpmi")
+
     with torch.no_grad():
         torch.cuda.empty_cache()
         clip_feats = torch.nn.functional.softmax(a*clip_feats, dim=1)
@@ -75,7 +90,8 @@ def soft_wpmi(clip_feats, target_feats, top_k=100, a=10, lam=1, device='cuda',
     return mutual_info
 
 def wpmi(clip_feats, target_feats, top_k=28, a=2, lam=0.6, device='cuda', min_prob=1e-7):
-    
+    _check_top_k(top_k, target_feats, "wpmi")
+
     with torch.no_grad():
         torch.cuda.empty_cache()
         
