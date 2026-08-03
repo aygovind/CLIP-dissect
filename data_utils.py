@@ -212,7 +212,11 @@ class CLIPVisionBackbone(torch.nn.Module):
         else:
             seq = x if self.batch_first else x.transpose(0, 1)
         pooled = seq[:, 0] if self.pool == "cls" else seq.mean(dim=1)
-        return pooled.float()
+        # .clone() is load-bearing. seq[:, 0] is a view into the block's full
+        # (batch, tokens, dim) output, and .float() is a no-op when the model is
+        # already fp32 -- so without an explicit copy every cached activation keeps
+        # its entire parent tensor alive and the run OOMs after a few dozen batches.
+        return pooled.float().clone()
 
     def layer_names(self):
         names = ["block_{}".format(i) for i in range(self.n_blocks)]
@@ -263,7 +267,9 @@ class TimmBackbone(torch.nn.Module):
             feats = feats[:, 0] if self.pool == "cls" else feats.mean(dim=1)
         elif feats.dim() == 4:                                # (B, D, H, W)
             feats = feats.mean(dim=[2, 3])
-        return self.out(feats.float())
+        # .clone() for the same reason as CLIPVisionBackbone._pool_tokens: the cls
+        # slice is a view, and caching it would pin the whole token tensor.
+        return self.out(feats.float().clone())
 
 
 def load_timm_backbone(target_name, device, pool="cls"):

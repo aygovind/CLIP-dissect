@@ -43,23 +43,28 @@ def get_activation(outputs, mode):
     '''
     mode: how to pool activations: one of avg, max
     for fc or ViT neurons does no pooling
+
+    Pooled activations are moved to the CPU before being appended. Keeping them on
+    the GPU means the list grows for the whole pass and competes with the forward
+    activations of the model producing it -- on a 63k-image probing set with a
+    wide layer that is enough to turn a comfortable batch size into an OOM.
     '''
     if mode=='avg':
         def hook(model, input, output):
             if len(output.shape)==4: #CNN layers
-                outputs.append(output.mean(dim=[2,3]).detach())
+                outputs.append(output.mean(dim=[2,3]).detach().cpu())
             elif len(output.shape)==3: #ViT
-                outputs.append(output[:, 0].clone())
+                outputs.append(output[:, 0].detach().cpu())
             elif len(output.shape)==2: #FC layers
-                outputs.append(output.detach())
+                outputs.append(output.detach().cpu())
     elif mode=='max':
         def hook(model, input, output):
             if len(output.shape)==4: #CNN layers
-                outputs.append(output.amax(dim=[2,3]).detach())
+                outputs.append(output.amax(dim=[2,3]).detach().cpu())
             elif len(output.shape)==3: #ViT
-                outputs.append(output[:, 0].clone())
+                outputs.append(output[:, 0].detach().cpu())
             elif len(output.shape)==2: #FC layers
-                outputs.append(output.detach())
+                outputs.append(output.detach().cpu())
     return hook
 
 def _clean_name(name):
@@ -135,8 +140,9 @@ def save_clip_image_features(model, dataset, save_name, batch_size=1000 , device
         os.makedirs(save_dir)
     with torch.no_grad():
         for images, labels in tqdm(DataLoader(dataset, batch_size, num_workers=NUM_WORKERS, pin_memory=True)):
-            features = model.encode_image(images.to(device))
-            all_features.append(features)
+            # .cpu() for the same reason as in get_activation: this list is held for
+            # the entire pass, and on the GPU it crowds out the forward activations.
+            all_features.append(model.encode_image(images.to(device)).cpu())
     torch.save(torch.cat(all_features), save_name)
     #free memory
     del all_features
